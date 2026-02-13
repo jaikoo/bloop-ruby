@@ -78,6 +78,18 @@ module Bloop
       )
     end
 
+    # Wrap a block and capture any raised exception, then re-raise.
+    #
+    # @param kwargs [Hash] Extra context passed to capture_exception (e.g. route_or_procedure:, metadata:)
+    # @yield The block to execute
+    # @return The block's return value
+    def with_error_capture(**kwargs, &block)
+      block.call
+    rescue Exception => e
+      capture_exception(e, **kwargs)
+      raise
+    end
+
     # Flush buffered events immediately.
     def flush
       @mutex.synchronize { flush_locked }
@@ -144,6 +156,39 @@ module Bloop
     def install_at_exit
       client = self
       at_exit { client.close }
+    end
+  end
+
+  # Rack middleware that captures unhandled exceptions and reports them to bloop.
+  #
+  # Works with Rails, Sinatra, Grape, and any Rack-compatible framework.
+  #
+  # @example Rails
+  #   # config/application.rb
+  #   config.middleware.use Bloop::RackMiddleware, client: Bloop::Client.new(...)
+  #
+  # @example Sinatra
+  #   use Bloop::RackMiddleware, client: Bloop::Client.new(...)
+  class RackMiddleware
+    # @param app [#call] The Rack application
+    # @param client [Bloop::Client] A configured bloop client instance
+    def initialize(app, client:)
+      @app = app
+      @client = client
+    end
+
+    def call(env)
+      @app.call(env)
+    rescue Exception => e
+      @client.capture_exception(e,
+        route_or_procedure: env["PATH_INFO"],
+        metadata: {
+          method: env["REQUEST_METHOD"],
+          query: env["QUERY_STRING"],
+          remote_ip: env["REMOTE_ADDR"],
+        }
+      )
+      raise
     end
   end
 end
