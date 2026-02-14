@@ -2,7 +2,7 @@
 
 Gem::Specification.new do |spec|
   spec.name          = "bloop-sdk"
-  spec.version       = "0.1.0"
+  spec.version       = "0.2.0"
   spec.authors       = ["bloop"]
   spec.summary       = "Ruby SDK for bloop error observability"
   spec.description   = "Capture and send error events to a bloop server. Zero external dependencies."

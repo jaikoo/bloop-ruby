@@ -4,9 +4,11 @@ require "openssl"
 require "net/http"
 require "json"
 require "uri"
+require "securerandom"
+require_relative "bloop/tracing"
 
 module Bloop
-  VERSION = "0.1.0"
+  VERSION = "0.2.0"
 
   class Client
     attr_reader :endpoint, :project_key
@@ -26,6 +28,7 @@ module Bloop
       @max_buffer_size = max_buffer_size
 
       @buffer = []
+      @trace_buffer = []
       @mutex = Mutex.new
       @closed = false
 
@@ -102,15 +105,49 @@ module Bloop
       @flush_thread&.kill
     end
 
+    # Start a new LLM trace for observability.
+    #
+    # @param name [String] Trace name (e.g. "chat-completion")
+    # @param session_id [String] Optional session identifier
+    # @param user_id [String] Optional user identifier
+    # @param input [Object] Optional input data
+    # @param metadata [Hash] Optional metadata
+    # @param prompt_name [String] Optional prompt template name
+    # @param prompt_version [String] Optional prompt version
+    # @return [Bloop::Trace]
+    def start_trace(name:, session_id: nil, user_id: nil, input: nil, metadata: nil,
+                    prompt_name: nil, prompt_version: nil)
+      Bloop::Trace.new(client: self, name: name, session_id: session_id,
+                       user_id: user_id, input: input, metadata: metadata,
+                       prompt_name: prompt_name, prompt_version: prompt_version)
+    end
+
+    # Wrap a block in a trace. Auto-finishes on success or error.
+    #
+    # @param name [String] Trace name
+    # @param kwargs [Hash] Extra args passed to start_trace
+    # @yield [Bloop::Trace] The trace object
+    # @return [Bloop::Trace]
+    def with_trace(name, **kwargs)
+      trace = start_trace(name: name, **kwargs)
+      yield trace
+      trace.finish(status: :completed) if trace.status == "running"
+      trace
+    rescue Exception => e
+      trace.finish(status: :error, output: e.message) if trace.status == "running"
+      raise
+    end
+
     private
 
     def flush_locked
-      return if @buffer.empty?
+      unless @buffer.empty?
+        events = @buffer.dup
+        @buffer.clear
+        Thread.new { send_events(events) }
+      end
 
-      events = @buffer.dup
-      @buffer.clear
-
-      Thread.new { send_events(events) }
+      flush_traces_locked
     end
 
     def send_events(events)
@@ -139,6 +176,41 @@ module Bloop
       http.request(req)
     rescue StandardError
       # Fire and forget — don't crash the host app
+    end
+
+    def enqueue_trace(trace)
+      @mutex.synchronize do
+        @trace_buffer << trace.to_h
+        flush_traces_locked if @trace_buffer.size >= @max_buffer_size
+      end
+    end
+
+    def flush_traces_locked
+      return if @trace_buffer.empty?
+
+      traces = @trace_buffer.dup
+      @trace_buffer.clear
+      Thread.new { send_traces(traces) }
+    end
+
+    def send_traces(traces)
+      traces.each_slice(50) do |batch|
+        body = JSON.generate({ traces: batch })
+        signature = OpenSSL::HMAC.hexdigest("SHA256", @project_key, body)
+        uri = URI("#{@endpoint}/v1/traces/batch")
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = (uri.scheme == "https")
+        http.open_timeout = 5
+        http.read_timeout = 10
+        req = Net::HTTP::Post.new(uri.path)
+        req["Content-Type"] = "application/json"
+        req["X-Signature"] = signature
+        req["X-Project-Key"] = @project_key
+        req.body = body
+        http.request(req)
+      end
+    rescue StandardError
+      # Fire and forget
     end
 
     def start_flush_thread
